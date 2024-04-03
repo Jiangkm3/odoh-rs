@@ -337,8 +337,10 @@ impl Deserialize for ObliviousDoHConfigContents {
 /// `ObliviousDoHMessageType` is supplied at the beginning of every ODoH message.
 /// It is used to specify whether a message is a query or a response.
 #[derive(Debug, Clone, Eq, PartialEq, Copy)]
-enum ObliviousDoHMessageType {
+pub enum ObliviousDoHMessageType {
+    /// 1 for query
     Query = 1,
+    /// 2 for response
     Response = 2,
 }
 
@@ -359,11 +361,12 @@ impl TryFrom<u8> for ObliviousDoHMessageType {
 /// structure being used, and the encrypted message for the target resolver, or a DNS response
 /// message for the client.
 pub struct ObliviousDoHMessage {
-    msg_type: ObliviousDoHMessageType,
-    // protocol: length prefix
-    key_id: Bytes,
-    // protocol: length prefix
-    encrypted_msg: Bytes,
+    /// Type: query or response?
+    pub msg_type: ObliviousDoHMessageType,
+    /// Public key of the target, 32 bytes
+    pub key_id: Bytes,
+    /// Encrypted message
+    pub encrypted_msg: Bytes,
 }
 
 impl ObliviousDoHMessage {
@@ -405,10 +408,10 @@ impl Serialize for &ObliviousDoHMessage {
 /// Structure holding unencrypted dns message and padding.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ObliviousDoHMessagePlaintext {
-    // protocol: length prefix
-    dns_msg: Bytes,
-    // protocol: length prefix
-    padding: Bytes,
+    /// DNS messages
+    pub dns_msg: Bytes,
+    /// Paddings
+    pub padding: Bytes,
 }
 
 impl ObliviousDoHMessagePlaintext {
@@ -520,13 +523,14 @@ impl ObliviousDoHKeyPair {
 pub fn encrypt_query<R: RngCore + CryptoRng>(
     query: &ObliviousDoHMessagePlaintext,
     config: &ObliviousDoHConfigContents,
+    proxy_list: Vec<&ObliviousDoHConfigContents>,
     rng: &mut R,
 ) -> Result<(ObliviousDoHMessage, OdohSecret)> {
     let server_pk = <Kem as KemTrait>::PublicKey::from_bytes(&config.public_key)?;
     let (encapped_key, mut send_ctx) =
         hpke::setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &server_pk, LABEL_QUERY, rng)?;
 
-    let key_id = config.identifier()?;
+    let mut key_id = config.identifier()?;
     let aad = build_aad(ObliviousDoHMessageType::Query, &key_id)?;
 
     let mut odoh_secret = OdohSecret::default();
@@ -536,12 +540,37 @@ pub fn encrypt_query<R: RngCore + CryptoRng>(
 
     let tag = send_ctx.seal_in_place_detached(&mut buf, &aad)?;
 
-    let result = [
+    // Encrypt the first query for target
+    let mut result = [
         encapped_key.to_bytes().as_slice(),
         &buf,
         tag.to_bytes().as_slice(),
     ]
     .concat();
+
+    // Recursively encrypt queries for proxies
+    for i in 0..proxy_list.len() {
+        let msg: Bytes = [key_id.to_vec(), result].concat().into();
+        let query = ObliviousDoHMessagePlaintext::new(&msg, 1);
+
+        key_id = proxy_list[i].identifier()?;
+        let aad = build_aad(ObliviousDoHMessageType::Query, &key_id)?;
+
+        let mut odoh_secret = OdohSecret::default();
+        send_ctx.export(LABEL_RESPONSE, &mut odoh_secret)?;
+
+        let mut buf = compose(&query)?;
+
+        let tag = send_ctx.seal_in_place_detached(&mut buf, &aad)?;
+
+        // Encrypt the first query for target
+        result = [
+            encapped_key.to_bytes().as_slice(),
+            &buf,
+            tag.to_bytes().as_slice(),
+        ]
+        .concat();
+    }
 
     let msg = ObliviousDoHMessage {
         msg_type: ObliviousDoHMessageType::Query,
