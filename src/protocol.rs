@@ -563,10 +563,11 @@ pub fn encrypt_query_with_proxies<R: RngCore + CryptoRng>(
     query: &ObliviousDoHMessagePlaintext,
     target_url: &String,
     config: &ObliviousDoHConfigContents,
+    num_hops: usize,
     proxy_names: &Vec<String>,
-    proxy_keys: Vec<&ObliviousDoHConfigContents>,
+    proxy_keys: &Vec<&ObliviousDoHConfigContents>,
     rng: &mut R,
-) -> Result<(ObliviousDoHMessage, OdohSecret)> {
+) -> Result<(usize, ObliviousDoHMessage, OdohSecret)> {
     let server_pk = <Kem as KemTrait>::PublicKey::from_bytes(&config.public_key)?;
     let (encapped_key, mut send_ctx) =
         hpke::setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &server_pk, LABEL_QUERY, rng)?;
@@ -589,9 +590,17 @@ pub fn encrypt_query_with_proxies<R: RngCore + CryptoRng>(
     ]
     .concat();
 
+    let mut current_proxy = 10000000000;
     // Recursively encrypt queries for proxies
-    for i in 0..proxy_keys.len() {
-        let proxy_pk = <Kem as KemTrait>::PublicKey::from_bytes(&proxy_keys[i].public_key)?;
+    for count in 0..num_hops {
+        let last_proxy = current_proxy;
+        // Randomly choose the next proxy
+        while current_proxy == last_proxy {
+            current_proxy = rng.next_u32() as usize % proxy_keys.len();
+        }
+        // println!("PROXY {}: {}", count, current_proxy);
+
+        let proxy_pk = <Kem as KemTrait>::PublicKey::from_bytes(&proxy_keys[current_proxy].public_key)?;
         let (encapped_key, mut send_ctx) =
             hpke::setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &proxy_pk, LABEL_QUERY, rng)?;
 
@@ -603,9 +612,9 @@ pub fn encrypt_query_with_proxies<R: RngCore + CryptoRng>(
         //   msg_len(8B): the length of the message
         //   msg(?B): the plaintext message
         //   dummy(?B): dummy paddings
-        let mut next_url: Vec<u8> = if i == 0 { target_url.as_bytes().to_vec() } else { proxy_names[i - 1].as_bytes().to_vec() };
+        let mut next_url: Vec<u8> = if count == 0 { target_url.as_bytes().to_vec() } else { proxy_names[last_proxy].as_bytes().to_vec() };
         next_url.insert(0, next_url.len().try_into().unwrap());
-        next_url.insert(0, if i == 0 { 0 } else { 1 });
+        next_url.insert(0, if count == 0 { 0 } else { 1 });
 
         let msg_len = result.len().to_be_bytes().to_vec();
         // dummy can take length between 0 to 32
@@ -614,7 +623,7 @@ pub fn encrypt_query_with_proxies<R: RngCore + CryptoRng>(
         let msg: Bytes = [next_url, key_id.to_vec(), msg_len, result, dummy].concat().into();
         let query = ObliviousDoHMessagePlaintext::new(&msg, 1);
 
-        key_id = proxy_keys[i].identifier()?;
+        key_id = proxy_keys[current_proxy].identifier()?;
         let aad = build_aad(ObliviousDoHMessageType::Query, &key_id)?;
 
         let mut odoh_secret = OdohSecret::default();
@@ -639,7 +648,7 @@ pub fn encrypt_query_with_proxies<R: RngCore + CryptoRng>(
         encrypted_msg: result.into(),
     };
 
-    Ok((msg, odoh_secret))
+    Ok((current_proxy, msg, odoh_secret))
 }
 
 /// Decrypt a DNS response from the server.
